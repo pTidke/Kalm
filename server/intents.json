@@ -1,0 +1,36 @@
+{
+  "anxiety": [
+    "panic-y, heart is pounding",
+    "constant worry about everything",
+    "social situations make me freak out",
+    "tight chest and restlessness",
+    "mind won't stop racing"
+  ],
+  "low_mood": [
+    "empty and hopeless",
+    "can't enjoy anything I used to",
+    "no energy to get out of bed",
+    "feel like a burden"
+  ],
+  "stress": [
+    "too many deadlines at once",
+    "juggling work and family is crushing me",
+    "can't keep up, everything is urgent"
+  ],
+  "sleep": [
+    "awake at 3am with thoughts spiraling",
+    "nightmares and light sleep",
+    "can't fall asleep even when tired"
+  ],
+  "relationship": [
+    "arguing with my partner constantly",
+    "feel unseen and misunderstood",
+    "friendship drifting and it's hurting"
+  ],
+  "neutral": [
+    "hi",
+    "just checking in",
+    "testing the bot",
+    "hello there"
+  ]
+}

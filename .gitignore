@@ -1,0 +1,28 @@
+cat > .gitignore <<'EOF'
+# macOS
+.DS_Store
+
+# Expo / React Native
+node_modules/
+.expo/
+.expo-shared/
+dist/
+web-build/
+android/
+ios/Pods/
+
+# Python / FastAPI
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+
+# Xcode
+ios/build/
+DerivedData/
+
+# Logs
+npm-debug.log*
+yarn-error.log*
+EOF

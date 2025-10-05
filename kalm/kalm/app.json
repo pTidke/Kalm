@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "Kalm Companion",
+    "slug": "kalm-companion",
+    "scheme": "kalmcompanion",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b1220"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.shadowclone.kalm",
+      "buildNumber": "1.0.0",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "UIViewControllerBasedStatusBarAppearance": true,
+        "UIStatusBarStyle": "UIStatusBarStyleLightContent",
+        "UIRequiresPersistentWiFi": false
+      }
+    },
+    "android": {
+      "package": "com.shadowclone.kalm",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0b1220"
+      }
+    },
+    "extra": {
+      "API_BASE": "http://127.0.0.1:3001",
+      // "API_BASE": "http://192.168.0.84:3001" ,
+      "eas": {
+        "projectId": "cdfd0876-e256-4706-a648-d9dfc4e26991"
+      }
+    }
+  }
+}
