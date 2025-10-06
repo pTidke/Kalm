@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  Animated,
 } from "react-native";
 import { RouteProp, useRoute } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -18,12 +19,64 @@ dayjs.extend(relativeTime);
 
 import { useThreads } from "../store/threads";
 import type { Message, RootStackParamList } from "../types";
-import { sendChat, transcribeAudio } from "../services/api";
+import { streamChat, transcribeAudio } from "../services/api";
 import Bubble from "../components/Bubble";
-import { theme } from "../ui/theme";
+import { theme, fs } from "../ui/theme";
 import { useAudioRecorder } from "../hooks/useAudioRecorder";
 
 type ChatRoute = RouteProp<RootStackParamList, "Chat">;
+
+const MIN_LINE_H = 20; // pairs with smaller body font
+
+function TypingDots() {
+  const a1 = useRef(new Animated.Value(0)).current;
+  const a2 = useRef(new Animated.Value(0)).current;
+  const a3 = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const pulse = (av: Animated.Value, delay: number) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(delay),
+          Animated.timing(av, { toValue: 1, duration: 300, useNativeDriver: true }),
+          Animated.timing(av, { toValue: 0.3, duration: 300, useNativeDriver: true }),
+          Animated.delay(150),
+        ])
+      ).start();
+    pulse(a1, 0);
+    pulse(a2, 150);
+    pulse(a3, 300);
+  }, [a1, a2, a3]);
+
+  const Dot = ({ av }: { av: Animated.Value }) => (
+    <Animated.View
+      style={{
+        width: 6,
+        height: 6,
+        borderRadius: 3,
+        backgroundColor: theme.colors.subtext,
+        marginHorizontal: 3,
+        opacity: av,
+        transform: [
+          {
+            translateY: av.interpolate({
+              inputRange: [0, 1],
+              outputRange: [0, -2],
+            }),
+          },
+        ],
+      }}
+    />
+  );
+
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", paddingVertical: 2 }}>
+      <Dot av={a1} />
+      <Dot av={a2} />
+      <Dot av={a3} />
+    </View>
+  );
+}
 
 export default function ChatScreen() {
   const insets = useSafeAreaInsets();
@@ -39,15 +92,14 @@ export default function ChatScreen() {
   const [typing, setTyping] = useState(false);
   const [focused, setFocused] = useState(false);
 
-  // Dynamically sized input height (1 line baseline = 22)
-  const [inputHeight, setInputHeight] = useState(22);
-  const INPUT_ROW_VERT_PAD = 8; // must match paddingVertical on the row
+  const [inputHeight, setInputHeight] = useState(MIN_LINE_H);
+  const ROW_VERT_PAD = 8;
 
-  // Recorder
   const rec = useAudioRecorder();
 
-  // Local optimistic list
   const [msgs, setMsgs] = useState<Message[]>([]);
+  const assistantBufferRef = useRef<string>("");
+  const streamCloser = useRef<{ close: () => void } | null>(null);
 
   useEffect(() => {
     if (thread && msgs.length === 0) setMsgs(thread.messages ?? []);
@@ -69,25 +121,68 @@ export default function ChatScreen() {
 
   if (!thread) {
     return (
-      <View
-        style={{
-          flex: 1,
-          backgroundColor: theme.colors.bg,
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
+      <View style={{ flex: 1, backgroundColor: theme.colors.bg, alignItems: "center", justifyContent: "center" }}>
         <ActivityIndicator />
-        <Text style={{ color: theme.colors.subtext, marginTop: 12 }}>
+        <Text style={{ color: theme.colors.subtext, marginTop: 12, fontSize: theme.type.body }}>
           Loading chat…
         </Text>
       </View>
     );
   }
 
+  // --- STREAMING ---
+  const startStreaming = (
+    convo: { role: string; content: string }[],
+    assistantId: string
+  ) => {
+    setTyping(true);
+    assistantBufferRef.current = "";
+
+    const closer = streamChat(
+      convo,
+      {
+        onDelta: (chunk) => {
+          assistantBufferRef.current += chunk;
+          setMsgs((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, text: assistantBufferRef.current } : m
+            )
+          );
+          scrollToEnd();
+        },
+        onDone: (info) => {
+          setTyping(false);
+          const finalText = assistantBufferRef.current || "…";
+          const finalized: Message = {
+            id: assistantId,
+            role: "assistant",
+            text: finalText,
+            createdAt: Date.now(),
+            intent: info.intent,
+          };
+          appendMessage(thread.id, finalized).catch(() => {});
+        },
+        onError: (err) => {
+          setTyping(false);
+          const msg: Message = {
+            id: assistantId,
+            role: "assistant",
+            text: "Sorry—streaming failed. Please try again.",
+            createdAt: Date.now(),
+          };
+          setMsgs((prev) => prev.map((m) => (m.id === assistantId ? msg : m)));
+          appendMessage(thread.id, msg).catch(() => {});
+          console.warn("ws stream error:", err);
+        },
+      },
+      { seed: undefined }
+    );
+    streamCloser.current = closer;
+  };
+
   const send = async (overrideText?: string) => {
     const text = (overrideText ?? value).trim();
-    if (!text || sending) return;
+    if (!text || sending || typing) return;
 
     const userMsg: Message = {
       id: Math.random().toString(),
@@ -97,43 +192,22 @@ export default function ChatScreen() {
     };
 
     setMsgs((prev) => [...prev, userMsg]);
-    scrollToEnd();
     appendMessage(thread.id, userMsg).catch(() => {});
     if (!overrideText) setValue("");
+    scrollToEnd();
 
-    setSending(true);
-    setTyping(true);
+    const assistantId = "a-" + Math.random().toString().slice(2);
+    const draft: Message = {
+      id: assistantId,
+      role: "assistant",
+      text: "",
+      createdAt: Date.now(),
+    };
+    setMsgs((prev) => [...prev, draft]);
+    scrollToEnd();
 
-    try {
-      const convo = [...data, userMsg].map((m) => ({
-        role: m.role,
-        content: m.text,
-      }));
-      const { reply, intent } = await sendChat(convo);
-
-      const botMsg: Message = {
-        id: Math.random().toString(),
-        role: "assistant",
-        text: reply,
-        createdAt: Date.now(),
-        intent,
-      };
-      setMsgs((prev) => [...prev, botMsg]);
-      appendMessage(thread.id, botMsg).catch(() => {});
-    } catch {
-      const err: Message = {
-        id: Math.random().toString(),
-        role: "assistant",
-        text: "Sorry—something went wrong. Please try again.",
-        createdAt: Date.now(),
-      };
-      setMsgs((prev) => [...prev, err]);
-      appendMessage(thread.id, err).catch(() => {});
-    } finally {
-      setSending(false);
-      setTyping(false);
-      setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
-    }
+    const convo = [...data, userMsg].map((m) => ({ role: m.role, content: m.text }));
+    startStreaming(convo, assistantId);
   };
 
   const Typing = () => (
@@ -149,11 +223,11 @@ export default function ChatScreen() {
         borderColor: theme.colors.line,
       }}
     >
-      <Text style={{ color: theme.colors.subtext }}>…</Text>
+      <TypingDots />
     </View>
   );
 
-  // Mic: tap to start, tap to stop → transcribe → send
+  // Mic button: press to start, press again to stop+transcribe+send
   const MicButton = () => (
     <Pressable
       onPress={async () => {
@@ -172,33 +246,27 @@ export default function ChatScreen() {
         }
       }}
       style={{
-        backgroundColor: rec.isRecording ? "#ef4444" : "#0ea5e9",
-        paddingVertical: 10,
-        paddingHorizontal: 14,
+        backgroundColor: rec.isRecording ? "#ef4444" : theme.colors.accent,
+        paddingVertical: 8,
+        paddingHorizontal: 12,
         borderRadius: theme.radius.pill,
       }}
     >
-      <View
-        style={{
-          width: 18,
-          height: 18,
-          borderRadius: 9,
-          backgroundColor: "white",
-        }}
-      />
+      <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: "white" }} />
     </Pressable>
   );
 
-  // --- Dynamic bottom padding so last message never touches the composer ---
-  const composerHeight = inputHeight + INPUT_ROW_VERT_PAD * 2; // row padding + input
-  const listBottomPadding =
-    composerHeight + theme.spacing.xl + insets.bottom; // extra cushion
+  // Composer -> list bottom padding so messages never clash with the input row
+  const composerHeight = inputHeight + ROW_VERT_PAD * 2;
+  const listBottomPadding = composerHeight + theme.spacing.xl + insets.bottom;
+
+  // --- SEND BUTTON STATE / STYLE ---
+  const canSend = !!value.trim() && !sending && !typing;
+  const isIdleDisabled = !value.trim() && !sending && !typing; // outlined when idle & empty
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.bg }}>
-      <View
-        style={{ height: insets.top, backgroundColor: theme.colors.surface }}
-      />
+      <View style={{ height: insets.top, backgroundColor: theme.colors.surface }} />
 
       <View
         style={{
@@ -210,14 +278,10 @@ export default function ChatScreen() {
           backgroundColor: theme.colors.surface,
         }}
       >
-        <Text
-          style={{ color: theme.colors.text, fontSize: 20, fontWeight: "800" }}
-        >
+        <Text style={{ color: theme.colors.text, fontSize: theme.type.title, fontWeight: "800" }}>
           {thread.title}
         </Text>
-        <Text
-          style={{ color: theme.colors.subtext, fontSize: 12, marginTop: 6 }}
-        >
+        <Text style={{ color: theme.colors.subtext, fontSize: theme.type.small, marginTop: 6 }}>
           Not medical advice. In emergencies call local services.
         </Text>
       </View>
@@ -235,15 +299,12 @@ export default function ChatScreen() {
           contentContainerStyle={{
             paddingHorizontal: theme.spacing.lg,
             paddingTop: theme.spacing.lg,
-            // 👇 dynamic bottom padding = composer height + safe area + cushion
             paddingBottom: listBottomPadding,
           }}
           renderItem={({ item }) => <Bubble msg={item} />}
           ListFooterComponent={typing ? <Typing /> : <View style={{ height: 0 }} />}
-          onContentSizeChange={() =>
-            listRef.current?.scrollToEnd({ animated: true })
-          }
-          extraData={[msgs, listBottomPadding]} // re-render when height changes
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+          extraData={[msgs, listBottomPadding, typing]}
         />
 
         <View
@@ -264,7 +325,7 @@ export default function ChatScreen() {
               borderWidth: 1,
               borderColor: theme.colors.line,
               paddingHorizontal: theme.spacing.md,
-              paddingVertical: INPUT_ROW_VERT_PAD,
+              paddingVertical: ROW_VERT_PAD,
               ...theme.shadow(6),
             }}
           >
@@ -275,19 +336,9 @@ export default function ChatScreen() {
               {!value && !focused && (
                 <View
                   pointerEvents="none"
-                  style={{
-                    position: "absolute",
-                    left: 0,
-                    right: 0,
-                    top: 0,
-                    bottom: 0,
-                    justifyContent: "center",
-                  }}
+                  style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center" }}
                 >
-                  <Text
-                    numberOfLines={1}
-                    style={{ color: theme.colors.subtext, fontSize: 16 }}
-                  >
+                  <Text numberOfLines={1} style={{ color: theme.colors.subtext, fontSize: theme.type.body }}>
                     Type your thoughts…
                   </Text>
                 </View>
@@ -301,40 +352,58 @@ export default function ChatScreen() {
                 onBlur={() => setFocused(false)}
                 onSubmitEditing={() => send()}
                 onContentSizeChange={(e) => {
-                  const h = Math.ceil(e.nativeEvent.contentSize.height || 22);
-                  setInputHeight(Math.max(22, Math.min(120, h)));
+                  const h = Math.ceil(e.nativeEvent.contentSize.height || MIN_LINE_H);
+                  setInputHeight(Math.max(MIN_LINE_H, Math.min(120, h)));
                 }}
                 style={{
-                  height: inputHeight, // explicit height keeps vertical center
+                  height: inputHeight,
                   color: theme.colors.text,
-                  fontSize: 16,
-                  lineHeight: 22,
+                  fontSize: theme.type.body,
+                  lineHeight: MIN_LINE_H,
                   paddingTop: 0,
                   paddingBottom: 0,
                   margin: 0,
-                  textAlignVertical: "center", // Android
-                  // @ts-ignore Android-only
+                  textAlignVertical: "center",
+                  // @ts-ignore android-only
                   includeFontPadding: false,
                 }}
               />
             </View>
 
+            {/* SEND BUTTON - outlined when empty/idle, filled when actionable or busy */}
             <Pressable
               onPress={() => send()}
-              disabled={!value.trim() || sending}
-              style={{
-                backgroundColor:
-                  !value.trim() || sending ? "#334155" : theme.colors.accent,
-                paddingVertical: 10,
-                paddingHorizontal: 16,
-                borderRadius: theme.radius.pill,
-                ...theme.shadow(4),
-              }}
+              disabled={!canSend}
+              style={[
+                {
+                  paddingVertical: 8,
+                  paddingHorizontal: 14,
+                  borderRadius: theme.radius.pill,
+                },
+                isIdleDisabled
+                  ? {
+                      backgroundColor: "transparent",
+                      borderWidth: 1,
+                      borderColor: theme.colors.accent,
+                    }
+                  : {
+                      backgroundColor: theme.colors.accent,
+                      ...theme.shadow(4),
+                    },
+              ]}
             >
-              {sending ? (
+              {sending || typing ? (
                 <ActivityIndicator color="#0b1220" />
               ) : (
-                <Text style={{ color: "#0b1220", fontWeight: "800" }}>Send</Text>
+                <Text
+                  style={{
+                    color: isIdleDisabled ? theme.colors.accent : "#0b1220",
+                    fontWeight: "800",
+                    fontSize: fs(14),
+                  }}
+                >
+                  Send
+                </Text>
               )}
             </Pressable>
           </View>
@@ -342,8 +411,8 @@ export default function ChatScreen() {
           {rec.error ? (
             <Text
               style={{
-                color: "#fca5a5",
-                fontSize: 12,
+                color: "#ef4444",
+                fontSize: theme.type.small,
                 marginTop: theme.spacing.sm,
                 textAlign: "center",
               }}
@@ -355,7 +424,7 @@ export default function ChatScreen() {
           <Text
             style={{
               color: theme.colors.subtext,
-              fontSize: 11,
+              fontSize: theme.type.micro,
               marginTop: theme.spacing.sm,
               alignSelf: "center",
             }}

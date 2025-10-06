@@ -5,6 +5,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { StatusBar } from "react-native";
 
 import { ThreadsProvider, useThreads } from './src/store/threads';
 import ChatListScreen from './src/screens/ChatListScreen';
@@ -13,6 +14,7 @@ import type { RootStackParamList } from './src/types';
 
 // keep splash on until we finish loading local threads
 SplashScreen.preventAutoHideAsync().catch(() => {});
+<StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 

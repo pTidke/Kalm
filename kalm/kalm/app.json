@@ -4,7 +4,7 @@
     "slug": "kalm-companion",
     "scheme": "kalmcompanion",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "light",
     "splash": {
       "image": "./assets/splash.png",
       "resizeMode": "contain",
@@ -17,7 +17,7 @@
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "UIViewControllerBasedStatusBarAppearance": true,
-        "UIStatusBarStyle": "UIStatusBarStyleLightContent",
+        "UIStatusBarStyle": "UIStatusBarStyleDarkContent",
         "UIRequiresPersistentWiFi": false
       }
     },
