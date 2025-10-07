@@ -1,4 +1,3 @@
-// src/services/api.ts
 import Constants from "expo-constants";
 
 export type ChatMsg = { role: "system" | "user" | "assistant"; content: string };
@@ -21,10 +20,9 @@ async function http<T = any>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-// ---- Whisper transcription ----
+// ---- Whisper transcription (one-shot) ----
 export async function transcribeAudio(fileUri: string): Promise<{ text: string }> {
   const form = new FormData();
-  // Best-effort content type; server just needs a file
   form.append(
     "file",
     {
@@ -33,7 +31,6 @@ export async function transcribeAudio(fileUri: string): Promise<{ text: string }
       type: "audio/m4a",
     } as any
   );
-
   const res = await fetch(`${API_BASE}/transcribe`, { method: "POST", body: form as any });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -42,7 +39,36 @@ export async function transcribeAudio(fileUri: string): Promise<{ text: string }
   return (await res.json()) as { text: string };
 }
 
-// ---- Non-stream fallback (used if stream yields zero tokens) ----
+// ---- Live ASR (micro-batch) ----
+export async function asrOpenSession(): Promise<{ sid: string }> {
+  return http<{ sid: string }>("/asr/session", { method: "POST" });
+}
+
+export async function asrAppend(
+  sid: string,
+  seq: number,
+  fileUri: string,
+  final: boolean
+): Promise<{ sid: string; text: string; final: boolean }> {
+  const form = new FormData();
+  form.append(
+    "file",
+    {
+      uri: fileUri,
+      name: `chunk-${seq}.m4a`,
+      type: "audio/m4a",
+    } as any
+  );
+  const qs = `sid=${encodeURIComponent(sid)}&seq=${seq}&final=${final ? "1" : "0"}`;
+  const res = await fetch(`${API_BASE}/asr/append?${qs}`, { method: "POST", body: form as any });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(t || "asr append failed");
+  }
+  return (await res.json()) as { sid: string; text: string; final: boolean };
+}
+
+// ---- Non-stream (fallback) ----
 export async function chatOnce(messages: ChatMsg[]): Promise<{ reply: string; intent?: string }> {
   return http<{ reply: string; intent?: string }>("/chat", {
     method: "POST",
@@ -60,20 +86,17 @@ export function streamChat(
   },
   opts?: { seed?: number }
 ): { close: () => void } {
-  // Convert http -> ws
   const wsUrl = `${API_BASE.replace(/^http/, "ws")}/ws/chat`;
 
-  // Simple whitespace fixer so "Hi" + "there" doesn't render "Hithere"
   const needSpace = (prev: string, next: string) => {
     if (!prev || !next) return false;
     const a = prev[prev.length - 1];
     const b = next[0];
-    return /[A-Za-z0-9)]/.test(a) && /[A-Za-z]/.test(b); // wordy boundary
+    return /[A-Za-z0-9)]/.test(a) && /[A-Za-z]/.test(b);
   };
   const normalizeDelta = (prev: string, raw: any): string => {
     const d = typeof raw === "string" ? raw : raw?.toString?.() ?? "";
     if (!d) return "";
-    // avoid collapsing existing whitespace, just prefix a single space when needed
     if (needSpace(prev, d)) return " " + d;
     return d;
   };
@@ -82,60 +105,40 @@ export function streamChat(
   let ws: WebSocket | null = null;
   let bufferSoFar = "";
 
-  // Watchdog: if we never receive a delta in N seconds, give up.
   const watchdogMs = 15000;
   let watchdog: any = setTimeout(() => {
-    try {
-      ws?.close();
-    } catch {}
+    try { ws?.close(); } catch {}
     if (!closed) handlers.onError(new Error("stream timeout"));
   }, watchdogMs);
-
-  function clearWatchdog() {
-    if (watchdog) {
-      clearTimeout(watchdog);
-      watchdog = null;
-    }
-  }
+  const clearWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null; } };
 
   try {
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      // Send initial message payload
-      ws?.send(
-        JSON.stringify({
-          type: "start",
-          messages,
-          seed: opts?.seed,
-        })
-      );
+      ws?.send(JSON.stringify({ type: "start", messages, seed: opts?.seed }));
     };
 
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
-        if (msg?.type === "delta") {
+        const kind = msg?.event ?? msg?.type; // support server sending {event:...}
+        if (kind === "delta") {
           const chunk = normalizeDelta(bufferSoFar, msg.text || "");
           if (chunk) {
             bufferSoFar += chunk;
             handlers.onDelta(chunk);
           }
-        } else if (msg?.type === "done") {
+        } else if (kind === "done") {
           clearWatchdog();
           handlers.onDone({ intent: msg.intent });
-          try {
-            ws?.close();
-          } catch {}
-        } else if (msg?.type === "error") {
+          try { ws?.close(); } catch {}
+        } else if (kind === "error") {
           clearWatchdog();
-          handlers.onError(new Error(msg.message || "stream error"));
-          try {
-            ws?.close();
-          } catch {}
+          handlers.onError(new Error(msg.detail || msg.message || "stream error"));
+          try { ws?.close(); } catch {}
         }
-      } catch (e) {
-        // If server sent raw text chunks (not JSON), treat it as a delta
+      } catch (_e) {
         const asText = String(ev.data ?? "");
         if (asText) {
           const chunk = normalizeDelta(bufferSoFar, asText);
@@ -162,9 +165,7 @@ export function streamChat(
   return {
     close: () => {
       closed = true;
-      try {
-        ws?.close();
-      } catch {}
+      try { ws?.close(); } catch {}
     },
   };
 }

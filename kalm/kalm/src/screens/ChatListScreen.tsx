@@ -1,4 +1,3 @@
-// src/screens/ChatListScreen.tsx
 import React, { useMemo, useState } from 'react';
 import {
   View,
@@ -15,19 +14,51 @@ import dayjs from 'dayjs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useThreads } from '../store/threads';
-import type { Thread, RootStackParamList } from '../types';
+import type { Thread, RootStackParamList, Message } from '../types';
 import { theme, fs } from '../ui/theme';
 
-// Replace 'Chat' with the actual route name you want to navigate to, as defined in RootStackParamList
+// ---- Types ----
 type Nav = NativeStackNavigationProp<RootStackParamList, 'Chat'>;
 
-const pastelBgs = [
-  '#E8F3FF', // soft blue
-  '#EAF7F0', // mint
-  '#FFF3EC', // peach
-  '#F5F0FF', // lavender
-  '#F8F9E9', // soft lemon
+type FocusTemplate = {
+  key: string;
+  chip: string;       // visible chip text
+  seedUser: string;   // first user message
+  systemHint: string; // hidden system background prompt
+};
+
+const FOCUS_TEMPLATES: FocusTemplate[] = [
+  {
+    key: 'anxiety',
+    chip: 'Anxiety check-in 🌿',
+    seedUser: "I'm feeling quite anxious today and it's hard to relax.",
+    systemHint:
+      'Focus on grounding, paced breathing (inhale 4 / exhale 6), and normalizing anxiety. Be concise, warm, and ask one gentle follow-up.',
+  },
+  {
+    key: 'sleep',
+    chip: 'Sleep journal 😴',
+    seedUser: "My sleep has been rough and I can’t switch off my mind at night.",
+    systemHint:
+      'Use CBT-I tips (sleep window, wind-down, stimulus control) in plain language. Offer one small step tonight.',
+  },
+  {
+    key: 'stress',
+    chip: 'Stress debrief 🧭',
+    seedUser: "I’m overwhelmed with work and can’t keep up.",
+    systemHint:
+      'Help with prioritization, break tasks into micro-steps, propose a 2-minute starter action. Keep it validating.',
+  },
+  {
+    key: 'mood',
+    chip: 'Low mood support 💛',
+    seedUser: "My mood’s been low and I’m not enjoying things lately.",
+    systemHint:
+      'Behavioral activation ideas + gentle validation. Suggest one tiny meaningful action today; ask a kind follow-up.',
+  },
 ];
+
+const pastelBgs = ['#E8F3FF', '#EAF7F0', '#FFF3EC', '#F5F0FF', '#F8F9E9'];
 
 function hashToIdx(s: string | number, mod: number) {
   const str = String(s);
@@ -196,27 +227,21 @@ function SearchBar({
   );
 }
 
-function QuickChips({ onPick }: { onPick: (title: string) => void }) {
-  const chips = [
-    { label: 'Anxiety check-in', emoji: '🌿' },
-    { label: 'Sleep journal', emoji: '😴' },
-    { label: 'Stress debrief', emoji: '🧭' },
-    { label: 'Low mood support', emoji: '💛' },
-  ];
+function QuickChips({ onPick }: { onPick: (tpl: FocusTemplate) => void }) {
   return (
     <ScrollView
       horizontal
       showsHorizontalScrollIndicator={false}
       contentContainerStyle={{ gap: 8 }}
     >
-      {chips.map((c) => (
+      {FOCUS_TEMPLATES.map((c) => (
         <Pressable
-          key={c.label}
-          onPress={() => onPick(c.label)}
+          key={c.key}
+          onPress={() => onPick(c)}
           style={{
             borderRadius: theme.radius.pill,
             borderWidth: 1,
-            borderColor: theme.colors.line,
+            borderColor: theme.colors.accent,
             backgroundColor: theme.colors.surface,
             paddingVertical: 8,
             paddingHorizontal: 12,
@@ -224,12 +249,12 @@ function QuickChips({ onPick }: { onPick: (title: string) => void }) {
         >
           <Text
             style={{
-              color: theme.colors.text,
+              color: theme.colors.accent,
               fontSize: theme.type.small,
-              fontWeight: '600',
+              fontWeight: '700',
             }}
           >
-            {c.emoji} {c.label}
+            {c.chip}
           </Text>
         </Pressable>
       ))}
@@ -240,10 +265,10 @@ function QuickChips({ onPick }: { onPick: (title: string) => void }) {
 export default function ChatListScreen() {
   const insets = useSafeAreaInsets();
   const nav = useNavigation<Nav>();
-  const { threads, createThread, deleteThread } = useThreads();
+  const { threads, createThread, deleteThread, appendMessage } = useThreads();
   const [query, setQuery] = useState('');
 
-  const open = (t: Thread) => nav.navigate('Chat', { id: t.id });
+  const open = (t: Thread, seed?: string) => nav.navigate('Chat', { id: t.id, seed });
 
   const onNew = async (title?: string) => {
     const t = await createThread(title);
@@ -255,6 +280,19 @@ export default function ChatListScreen() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: () => deleteThread(t.id) },
     ]);
+  };
+
+  // When a focused chip is tapped: create thread, save hidden system prompt, navigate with seed
+  const onPickTemplate = async (tpl: FocusTemplate) => {
+    const t = await createThread(tpl.chip);
+    const sys: Message = {
+      id: Math.random().toString(),
+      role: 'system',
+      text: tpl.systemHint,
+      createdAt: Date.now(),
+    };
+    await appendMessage(t.id, sys);
+    open(t, tpl.seedUser);
   };
 
   const data = useMemo(() => {
@@ -293,15 +331,6 @@ export default function ChatListScreen() {
         >
           Kalm Companion
         </Text>
-        {/* <Text
-          style={{
-            color: theme.colors.subtext,
-            fontSize: theme.type.small,
-            marginTop: 6,
-          }}
-        >
-          Choose a chat or start a new one
-        </Text> */}
       </View>
 
       <FlatList
@@ -347,7 +376,7 @@ export default function ChatListScreen() {
               </Text>
 
               <View style={{ marginTop: 10 }}>
-                <QuickChips onPick={(title) => onNew(title)} />
+                <QuickChips onPick={onPickTemplate} />
               </View>
             </View>
 

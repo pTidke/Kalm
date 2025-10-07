@@ -1,4 +1,4 @@
-export type Role = 'user' | 'assistant';
+export type Role = 'user' | 'assistant' | 'system';
 
 export type Message = {
   id: string;
@@ -18,5 +18,5 @@ export type Thread = {
 
 export type RootStackParamList = {
   List: undefined;
-  Chat: { id: string };
+  Chat: { id: string; seed?: string };
 };

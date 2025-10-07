@@ -8,6 +8,8 @@ import threading
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
+import uuid, re
+
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
@@ -95,6 +97,63 @@ def load_json(path: Path) -> Any:
 
 KB_RAW: List[KBEntry] = [KBEntry(**row) for row in load_json(KB_PATH)]
 INTENTS: Dict[str, List[str]] = load_json(INTENTS_PATH)
+
+# ---------- Live ASR (micro-batch) utilities ----------
+
+ASR_SESSIONS: dict[str, dict] = {}  # sid -> {"text": str}
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[^\sA-Za-z0-9']")
+
+def _tokenize(s: str) -> list[str]:
+    return _TOKEN_RE.findall(s or "")
+
+def _norm(tok: str) -> str:
+    # normalize for overlap matching
+    return tok.lower()
+
+def _detok(tokens: list[str]) -> str:
+    # simple detokenizer to keep spacing readable
+    out = []
+    for i, t in enumerate(tokens):
+        if i == 0:
+            out.append(t)
+            continue
+        prev = tokens[i - 1]
+        # no space before closing punct, or after opening bracket
+        if t in ".,!?;:%)]}" or prev in "([{":
+            out.append(t)
+        else:
+            out.append(" " + t)
+    return "".join(out)
+
+def merge_transcripts(prev: str, new: str, max_overlap: int = 12) -> str:
+    """Word-level suffix/prefix merge to avoid dupes and missing spaces."""
+    prev = (prev or "").strip()
+    new = (new or "").strip()
+    if not prev:
+        return new
+    if not new:
+        return prev
+
+    pw = _tokenize(prev)
+    nw = _tokenize(new)
+    pn = [_norm(t) for t in pw]
+    nn = [_norm(t) for t in nw]
+
+    kmax = min(max_overlap, len(pw), len(nw))
+    k = 0
+    for j in range(kmax, 0, -1):
+        if pn[-j:] == nn[:j]:
+            k = j
+            break
+
+    remainder = nw[k:]
+    if not remainder:
+        return prev
+
+    # Decide if we need a space between prev and remainder text
+    need_space = (prev and prev[-1].isalnum() and remainder[0].isalnum())
+    return prev + (" " if need_space else "") + _detok(remainder)
 
 # ---------------- Embeddings ----------------
 embedder = SentenceTransformer(EMBED_MODEL_ID)
@@ -401,6 +460,52 @@ def chat(body: ChatIn):
     }
 
 # ---------------- WebSocket (Streaming) ----------------
+from fastapi import Query
+
+@app.post("/asr/session")
+def asr_open_session():
+    sid = uuid.uuid4().hex[:12]
+    ASR_SESSIONS[sid] = {"text": ""}
+    return {"sid": sid}
+
+@app.post("/asr/append")
+async def asr_append(
+    sid: str = Query(...),
+    seq: int = Query(0, ge=0),
+    final: bool = Query(False),
+    file: UploadFile = File(...)
+):
+    if not WHISPER_READY or WHISPER is None:
+        raise HTTPException(status_code=500, detail="Whisper model not initialized. Install faster-whisper and ffmpeg.")
+    sess = ASR_SESSIONS.get(sid)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown ASR session")
+
+    try:
+        import tempfile, os as _os
+        suffix = Path(file.filename or "clip").suffix or ".m4a"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            data = await file.read()
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        segments, info = WHISPER.transcribe(tmp_path, beam_size=1)
+        clip_text = "".join(seg.text for seg in segments).strip()
+        _os.unlink(tmp_path)
+
+        merged = merge_transcripts(sess["text"], clip_text)
+        sess["text"] = merged
+
+        if final:
+            # finalize + cleanup
+            text = sess["text"].strip()
+            ASR_SESSIONS.pop(sid, None)
+            return {"sid": sid, "text": text, "final": True}
+
+        return {"sid": sid, "text": sess["text"], "final": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
     origin = websocket.headers.get("origin")
@@ -500,6 +605,9 @@ except Exception:
 async def transcribe(file: UploadFile = File(...)):
     if not WHISPER_READY or WHISPER is None:
         raise HTTPException(status_code=500, detail="Whisper model not initialized. Install faster-whisper and ffmpeg.")
+
+    # Toggle via env: ENGLISH_ONLY=1 (default) forces English
+    ENGLISH_ONLY = os.getenv("ENGLISH_ONLY", "1") == "1"
     try:
         import tempfile, os as _os
         suffix = Path(file.filename or "audio").suffix or ".m4a"
@@ -507,12 +615,38 @@ async def transcribe(file: UploadFile = File(...)):
             data = await file.read()
             tmp.write(data)
             tmp_path = tmp.name
-        segments, info = WHISPER.transcribe(tmp_path, beam_size=1)
+
+        # Force English transcription. If the input isn't English, Whisper will not
+        # auto-switch languages; it’ll try to decode as English (often resulting in
+        # blanks/garble instead of picking another language).
+        segments, info = WHISPER.transcribe(
+            tmp_path,
+            language=("en" if ENGLISH_ONLY else None),
+            task="transcribe",
+            beam_size=1,
+            vad_filter=True,  # trims long silences for nicer UX
+        )
+
         text = "".join(seg.text for seg in segments).strip()
+
+        # Optional hard rejection if Whisper still thinks language != en with high confidence.
+        # (Note: when language="en" is set, info.language is typically "en", but we keep this guard.)
+        lang = getattr(info, "language", "en")
+        lang_p = float(getattr(info, "language_probability", 0.0) or 0.0)
+
+        if ENGLISH_ONLY and lang != "en" and lang_p >= 0.60:
+            # Strict mode: refuse non-English confidently detected audio
+            _os.unlink(tmp_path)
+            raise HTTPException(status_code=400, detail="English only: detected non-English speech.")
+
         _os.unlink(tmp_path)
-        return {"text": text, "language": getattr(info, "language", None)}
+        return {"text": text, "language": lang, "language_probability": lang_p}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # -------- Admin --------
 @app.post("/admin/reload_intents")
