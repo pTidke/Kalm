@@ -1,90 +1,120 @@
-import { useState } from "react";
-import { Audio } from "expo-av";
+// src/hooks/useAudioRecorder.ts
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useAudioRecorder as useExpoAudioRecorder,
+  useAudioRecorderState,
+  RecordingPresets,
+  setAudioModeAsync,
+  AudioModule,
+} from "expo-audio";
 
-// Read constants in a TS-safe way across SDKs
-const A: any = Audio;
-
-const FALLBACK_OPTIONS: Audio.RecordingOptions = {
-  android: {
-    extension: ".m4a",
-    // fall back to known numeric values if constants don't exist
-    outputFormat: A.RECORDING_OPTION_ANDROID_OUTPUT_FORMAT_MPEG_4 ?? 2,
-    audioEncoder: A.RECORDING_OPTION_ANDROID_AUDIO_ENCODER_AAC ?? 3,
-    sampleRate: 44100,
-    numberOfChannels: 1,
-    bitRate: 96000,
-  },
-  ios: {
-    extension: ".m4a",
-    audioQuality: A.RECORDING_OPTION_IOS_AUDIO_QUALITY_HIGH ?? 0,
-    outputFormat: A.RECORDING_OPTION_IOS_OUTPUT_FORMAT_MPEG4AAC ?? 2,
-    sampleRate: 44100,
-    numberOfChannels: 1,
-    bitRate: 96000,
-    linearPCMBitDepth: 16,
-    linearPCMIsBigEndian: false,
-    linearPCMIsFloat: false,
-  },
-  web: {
-    mimeType: "audio/webm",
-    bitsPerSecond: 96000,
-  },
+type RecState = {
+  isRecording: boolean;
+  isBusy: boolean;
+  durationMs: number;
+  uri: string | null;
+  error: string | null;
+  start: () => Promise<void>;
+  stop: () => Promise<string | null>;
+  toggle: () => Promise<string | null>;
 };
 
-export function useAudioRecorder() {
-  const [isRecording, setIsRecording] = useState(false);
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export function useAudioRecorder(): RecState {
+  // Recorder instance + live state (poll ~200ms for snappy UI updates)
+  const recorder = useExpoAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const s = useAudioRecorderState(recorder, 200);
+
+  // Local UI state
   const [error, setError] = useState<string | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+
+  // Refs for robustness
+  const urlRef = useRef<string | null>(null);       // always the latest URL from state
+  const lastTapRef = useRef<number>(0);             // debounce rapid taps
+
+  useEffect(() => {
+    urlRef.current = s.url ?? null;
+  }, [s.url]);
+
+  // Permissions + audio mode (once)
+  useEffect(() => {
+    (async () => {
+      try {
+        const perm = await AudioModule.requestRecordingPermissionsAsync();
+        if (!perm.granted) {
+          setError("Microphone permission denied");
+          return;
+        }
+        await setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
+        });
+      } catch (e: any) {
+        setError(e?.message ?? "Audio init failed");
+      }
+    })();
+    // no cleanup required; expo-audio handles release on unmount
+  }, []);
 
   async function start() {
+    if (isBusy || s.isRecording) return;
+    setError(null);
+    setIsBusy(true);
     try {
-      setError(null);
-
-      const perm = await Audio.requestPermissionsAsync();
-      if (!perm.granted) throw new Error("Microphone permission not granted");
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        // keep Android defaults simple for widest compatibility
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-      });
-
-      const rec = new Audio.Recording();
-
-      // Prefer new preset API if present; else use our fallback options
-      const preset =
-        A?.RecordingOptionsPresets?.HIGH_QUALITY ?? FALLBACK_OPTIONS;
-
-      await rec.prepareToRecordAsync(preset);
-      await rec.startAsync();
-
-      setRecording(rec);
-      setIsRecording(true);
+      await recorder.prepareToRecordAsync();
+      recorder.record();
     } catch (e: any) {
       setError(e?.message ?? "Failed to start recording");
-      setIsRecording(false);
-      setRecording(null);
+    } finally {
+      setIsBusy(false);
     }
   }
 
   async function stop(): Promise<string | null> {
+    if (isBusy || !s.isRecording) return null;
+    setIsBusy(true);
     try {
-      if (!recording) return null;
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setIsRecording(false);
-      setRecording(null);
+      await recorder.stop();
+
+      // expo-audio may surface the URL slightly after stop() resolves.
+      // Wait briefly (up to ~600ms) for the URL to appear.
+      let uri: string | null = urlRef.current ?? (recorder as any)?.uri ?? null;
+      for (let i = 0; i < 10 && !uri; i++) {
+        await delay(60);
+        uri = urlRef.current ?? (recorder as any)?.uri ?? null;
+      }
       return uri ?? null;
     } catch (e: any) {
       setError(e?.message ?? "Failed to stop recording");
-      setIsRecording(false);
-      setRecording(null);
       return null;
+    } finally {
+      setIsBusy(false);
     }
   }
 
-  return { isRecording, start, stop, error };
+  async function toggle(): Promise<string | null> {
+    // Debounce rapid taps to avoid double-activating during transitions
+    const now = Date.now();
+    if (now - lastTapRef.current < 300) return null;
+    lastTapRef.current = now;
+
+    if (isBusy) return null;
+    return s.isRecording ? stop() : (await start(), null);
+  }
+
+  // Derived state for consumers
+  const state = useMemo(
+    () => ({
+      isRecording: s.isRecording,
+      isBusy,
+      durationMs: s.durationMillis ?? 0,
+      uri: urlRef.current,
+      error,
+    }),
+    [s.isRecording, s.durationMillis, isBusy, error]
+  );
+
+  return { ...state, start, stop, toggle };
 }

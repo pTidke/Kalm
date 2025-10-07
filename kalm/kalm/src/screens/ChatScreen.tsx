@@ -19,14 +19,15 @@ dayjs.extend(relativeTime);
 
 import { useThreads } from "../store/threads";
 import type { Message, RootStackParamList } from "../types";
-import { streamChat, transcribeAudio } from "../services/api";
+import { streamChat, chatOnce, transcribeAudio } from "../services/api";
 import Bubble from "../components/Bubble";
 import { theme, fs } from "../ui/theme";
 import { useAudioRecorder } from "../hooks/useAudioRecorder";
 
 type ChatRoute = RouteProp<RootStackParamList, "Chat">;
 
-const MIN_LINE_H = 20; // pairs with smaller body font
+const MIN_LINE_H = 20;
+const ROW_VERT_PAD = 8;
 
 function TypingDots() {
   const a1 = useRef(new Animated.Value(0)).current;
@@ -88,12 +89,9 @@ export default function ChatScreen() {
 
   const listRef = useRef<FlatList<Message>>(null);
   const [value, setValue] = useState("");
-  const [sending, setSending] = useState(false);
   const [typing, setTyping] = useState(false);
   const [focused, setFocused] = useState(false);
-
   const [inputHeight, setInputHeight] = useState(MIN_LINE_H);
-  const ROW_VERT_PAD = 8;
 
   const rec = useAudioRecorder();
 
@@ -111,78 +109,107 @@ export default function ChatScreen() {
     if (storeMsgs.length > msgs.length) setMsgs(storeMsgs);
   }, [thread?.messages, thread?.updatedAt]); // eslint-disable-line
 
-  const data = useMemo(
-    () => [...msgs].sort((a, b) => a.createdAt - b.createdAt),
-    [msgs]
-  );
-
-  const scrollToEnd = () =>
-    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 16);
+  const data = useMemo(() => [...msgs].sort((a, b) => a.createdAt - b.createdAt), [msgs]);
+  const scrollToEnd = () => setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 16);
 
   if (!thread) {
     return (
       <View style={{ flex: 1, backgroundColor: theme.colors.bg, alignItems: "center", justifyContent: "center" }}>
         <ActivityIndicator />
-        <Text style={{ color: theme.colors.subtext, marginTop: 12, fontSize: theme.type.body }}>
-          Loading chat…
-        </Text>
+        <Text style={{ color: theme.colors.subtext, marginTop: 12, fontSize: theme.type.body }}>Loading chat…</Text>
       </View>
     );
   }
 
-  // --- STREAMING ---
-  const startStreaming = (
-    convo: { role: string; content: string }[],
-    assistantId: string
+  // Keep dots visible until the bubble is added & rendered
+  const hideTypingAfterRender = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => setTyping(false));
+    });
+  };
+
+  // ---- STREAMING (no partial bubble; dots only; add bubble when done) ----
+  const startStreaming = async (
+    convo: { role: "assistant" | "user" | "system"; content: string }[]
   ) => {
     setTyping(true);
     assistantBufferRef.current = "";
+    streamCloser.current?.close();
+    scrollToEnd();
+
+    let finished = false;
 
     const closer = streamChat(
       convo,
       {
         onDelta: (chunk) => {
           assistantBufferRef.current += chunk;
-          setMsgs((prev) =>
-            prev.map((m) =>
-              m.id === assistantId ? { ...m, text: assistantBufferRef.current } : m
-            )
-          );
-          scrollToEnd();
         },
-        onDone: (info) => {
-          setTyping(false);
-          const finalText = assistantBufferRef.current || "…";
-          const finalized: Message = {
-            id: assistantId,
+        onDone: async (info) => {
+          finished = true;
+          let text = assistantBufferRef.current.trim();
+
+          if (!text) {
+            try {
+              const { reply } = await chatOnce(convo as any);
+              text = reply?.trim() || "Sorry—no response right now.";
+            } catch {
+              text = "Sorry—no response right now.";
+            }
+          }
+
+          const finalMsg: Message = {
+            id: "a-" + Math.random().toString().slice(2),
             role: "assistant",
-            text: finalText,
+            text,
             createdAt: Date.now(),
             intent: info.intent,
           };
-          appendMessage(thread.id, finalized).catch(() => {});
+          setMsgs((prev) => [...prev, finalMsg]);
+          appendMessage(thread.id, finalMsg).catch(() => {});
+          scrollToEnd();
+          hideTypingAfterRender();
         },
-        onError: (err) => {
-          setTyping(false);
-          const msg: Message = {
-            id: assistantId,
+        onError: async (err) => {
+          // Fallback if we never got any chunk
+          if (!assistantBufferRef.current && !finished) {
+            try {
+              const { reply } = await chatOnce(convo as any);
+              const finalMsg: Message = {
+                id: "a-" + Math.random().toString().slice(2),
+                role: "assistant",
+                text: reply?.trim() || "Sorry—no response right now.",
+                createdAt: Date.now(),
+              };
+              setMsgs((prev) => [...prev, finalMsg]);
+              appendMessage(thread.id, finalMsg).catch(() => {});
+              scrollToEnd();
+              hideTypingAfterRender();
+              return;
+            } catch {}
+          }
+          const errMsg: Message = {
+            id: "a-" + Math.random().toString().slice(2),
             role: "assistant",
-            text: "Sorry—streaming failed. Please try again.",
+            text: assistantBufferRef.current || "Sorry—streaming failed. Please try again.",
             createdAt: Date.now(),
           };
-          setMsgs((prev) => prev.map((m) => (m.id === assistantId ? msg : m)));
-          appendMessage(thread.id, msg).catch(() => {});
+          setMsgs((prev) => [...prev, errMsg]);
+          appendMessage(thread.id, errMsg).catch(() => {});
+          scrollToEnd();
+          hideTypingAfterRender();
           console.warn("ws stream error:", err);
         },
       },
       { seed: undefined }
     );
+
     streamCloser.current = closer;
   };
 
   const send = async (overrideText?: string) => {
     const text = (overrideText ?? value).trim();
-    if (!text || sending || typing) return;
+    if (!text || typing) return;
 
     const userMsg: Message = {
       id: Math.random().toString(),
@@ -196,21 +223,15 @@ export default function ChatScreen() {
     if (!overrideText) setValue("");
     scrollToEnd();
 
-    const assistantId = "a-" + Math.random().toString().slice(2);
-    const draft: Message = {
-      id: assistantId,
-      role: "assistant",
-      text: "",
-      createdAt: Date.now(),
-    };
-    setMsgs((prev) => [...prev, draft]);
-    scrollToEnd();
+    const convo = [...data, userMsg].map((m) => ({
+      role: m.role as "user" | "assistant" | "system",
+      content: m.text,
+    })) as { role: "assistant" | "user" | "system"; content: string }[];
 
-    const convo = [...data, userMsg].map((m) => ({ role: m.role, content: m.text }));
-    startStreaming(convo, assistantId);
+    await startStreaming(convo);
   };
 
-  const Typing = () => (
+  const TypingFooter = () => (
     <View
       style={{
         alignSelf: "flex-start",
@@ -227,47 +248,46 @@ export default function ChatScreen() {
     </View>
   );
 
-  // Mic button: press to start, press again to stop+transcribe+send
+  // Mic button (single-tap toggle)
   const MicButton = () => (
     <Pressable
       onPress={async () => {
-        if (!rec.isRecording) {
-          await rec.start();
-        } else {
-          const uri = await rec.stop();
-          if (uri) {
-            try {
-              const { text } = await transcribeAudio(uri);
-              if (text?.trim()) await send(text.trim());
-            } catch (e) {
-              console.warn("transcribe error", e);
-            }
+        if (rec.isBusy) return;
+        const uri = await rec.toggle();
+        if (uri) {
+          try {
+            const { text } = await transcribeAudio(uri);
+            if (text?.trim()) await send(text.trim());
+          } catch (e) {
+            console.warn("transcribe error", e);
           }
         }
       }}
+      disabled={rec.isBusy}
       style={{
+        opacity: rec.isBusy ? 0.6 : 1,
         backgroundColor: rec.isRecording ? "#ef4444" : theme.colors.accent,
         paddingVertical: 8,
         paddingHorizontal: 12,
         borderRadius: theme.radius.pill,
       }}
+      hitSlop={12}
     >
       <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: "white" }} />
     </Pressable>
   );
 
-  // Composer -> list bottom padding so messages never clash with the input row
   const composerHeight = inputHeight + ROW_VERT_PAD * 2;
   const listBottomPadding = composerHeight + theme.spacing.xl + insets.bottom;
 
-  // --- SEND BUTTON STATE / STYLE ---
-  const canSend = !!value.trim() && !sending && !typing;
-  const isIdleDisabled = !value.trim() && !sending && !typing; // outlined when idle & empty
+  const canSend = !!value.trim() && !typing;
+  const isIdleDisabled = !value.trim() && !typing;
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.bg }}>
       <View style={{ height: insets.top, backgroundColor: theme.colors.surface }} />
 
+      {/* Header */}
       <View
         style={{
           paddingHorizontal: theme.spacing.xl,
@@ -302,11 +322,12 @@ export default function ChatScreen() {
             paddingBottom: listBottomPadding,
           }}
           renderItem={({ item }) => <Bubble msg={item} />}
-          ListFooterComponent={typing ? <Typing /> : <View style={{ height: 0 }} />}
+          ListFooterComponent={typing ? <TypingFooter /> : <View style={{ height: 0 }} />}
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
           extraData={[msgs, listBottomPadding, typing]}
         />
 
+        {/* Composer */}
         <View
           style={{
             paddingHorizontal: theme.spacing.lg,
@@ -314,7 +335,6 @@ export default function ChatScreen() {
             backgroundColor: theme.colors.bg,
           }}
         >
-          {/* INPUT ROW */}
           <View
             style={{
               flexDirection: "row",
@@ -331,7 +351,6 @@ export default function ChatScreen() {
           >
             <MicButton />
 
-            {/* Placeholder wrapper */}
             <View style={{ flex: 1, justifyContent: "center" }}>
               {!value && !focused && (
                 <View
@@ -370,29 +389,17 @@ export default function ChatScreen() {
               />
             </View>
 
-            {/* SEND BUTTON - outlined when empty/idle, filled when actionable or busy */}
             <Pressable
               onPress={() => send()}
               disabled={!canSend}
               style={[
-                {
-                  paddingVertical: 8,
-                  paddingHorizontal: 14,
-                  borderRadius: theme.radius.pill,
-                },
+                { paddingVertical: 8, paddingHorizontal: 14, borderRadius: theme.radius.pill },
                 isIdleDisabled
-                  ? {
-                      backgroundColor: "transparent",
-                      borderWidth: 1,
-                      borderColor: theme.colors.accent,
-                    }
-                  : {
-                      backgroundColor: theme.colors.accent,
-                      ...theme.shadow(4),
-                    },
+                  ? { backgroundColor: "transparent", borderWidth: 1, borderColor: theme.colors.accent }
+                  : { backgroundColor: theme.colors.accent, ...theme.shadow(4) },
               ]}
             >
-              {sending || typing ? (
+              {typing ? (
                 <ActivityIndicator color="#0b1220" />
               ) : (
                 <Text

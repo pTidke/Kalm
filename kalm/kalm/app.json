@@ -18,7 +18,8 @@
         "ITSAppUsesNonExemptEncryption": false,
         "UIViewControllerBasedStatusBarAppearance": true,
         "UIStatusBarStyle": "UIStatusBarStyleDarkContent",
-        "UIRequiresPersistentWiFi": false
+        "UIRequiresPersistentWiFi": false,
+        "NSAppTransportSecurity": { "NSAllowsArbitraryLoads": true }
       }
     },
     "android": {
@@ -31,10 +32,14 @@
     },
     "extra": {
       "API_BASE": "http://127.0.0.1:3001",
-      // "API_BASE": "http://192.168.0.84:3001" ,
       "eas": {
         "projectId": "cdfd0876-e256-4706-a648-d9dfc4e26991"
       }
-    }
+    },
+    "plugins": [
+      ["expo-audio", {
+        "microphonePermission": "We use the mic to transcribe your voice."
+      }]
+    ]
   }
 }
